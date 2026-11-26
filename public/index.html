@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"/>
+<meta name="theme-color" content="#2563eb"/>
+<title>FileTrack — File Tracking System</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ LOGIN ============ -->
+<div id="loginOverlay" class="login-overlay">
+  <div class="login-card">
+    <div class="login-brand">
+      <div class="logo">FT</div>
+      <div><b>FileTrack</b><small>File Tracking System</small></div>
+    </div>
+    <h2>Sign In</h2>
+    <form id="loginForm">
+      <label class="lbl">Username</label>
+      <input id="loginUser" autocomplete="username" placeholder="username" required>
+      <label class="lbl">Password</label>
+      <input id="loginPass" type="password" autocomplete="current-password" placeholder="••••••••" required>
+      <button class="btn primary block" type="submit" style="margin-top:20px">Sign In</button>
+      <p class="hint" style="text-align:center;margin-top:14px">
+        Default credentials → <b>admin</b> / <b>Admin@123</b>
+      </p>
+    </form>
+  </div>
+</div>
+
+<!-- ============ APP ============ -->
+<div class="app" style="display:none">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">FT</div>
+      <div><b>FileTrack</b><small>File Tracking System</small></div>
+    </div>
+    <a class="nav-item" data-nav href="#/dashboard">🏠 <span>Dashboard</span></a>
+    <a class="nav-item" data-nav href="#/files">📁 <span>My Files</span></a>
+    <a class="nav-item" data-nav href="#/new">➕ <span>New File</span></a>
+    <a class="nav-item" data-nav href="#/scan">🔍 <span>Scan / Lookup</span></a>
+    <a class="nav-item" data-nav href="#/admin" id="navAdmin" style="display:none">🛡 <span>Admin</span></a>
+    <a class="nav-item" data-nav href="#/settings">⚙️ <span>Account</span></a>
+    <div class="sidebar-foot">
+      <button class="user-chip" id="userChipSide" onclick="showUserMenu()"></button>
+    </div>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <div class="brand-mobile"><div class="logo">FT</div><span>FileTrack</span></div>
+      <div class="spacer"></div>
+      <button class="user-chip" id="userChip" onclick="showUserMenu()"></button>
+    </header>
+    <main class="view" id="view"></main>
+  </div>
+</div>
+
+<nav class="bottomnav" id="bottomnav" style="display:none">
+  <a data-nav href="#/dashboard">🏠<span>Home</span></a>
+  <a data-nav href="#/files">📁<span>Files</span></a>
+  <a data-nav href="#/new">➕<span>New</span></a>
+  <a data-nav href="#/scan">🔍<span>Scan</span></a>
+  <a data-nav href="#/settings">⚙️<span>Account</span></a>
+</nav>
+
+<div class="modal" id="modal">
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="mTitle">Title</h3>
+      <button type="button" onclick="hideModal()" aria-label="Close">&times;</button>
+    </div>
+    <div class="modal-body" id="mBody"></div>
+    <div class="modal-foot">
+      <button class="btn ghost" id="mCancel" onclick="hideModal()">Cancel</button>
+      <button class="btn primary" id="mOk">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<div class="toasts" id="toasts"></div>
+<div id="printArea"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
