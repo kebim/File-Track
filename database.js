@@ -10,14 +10,10 @@ const db = new Database(path.join(DATA_DIR, 'filetrack.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
-/* ---------- schema version — bump to migrate ---------- */
-const SCHEMA_VERSION = 4;
-
+const SCHEMA_VERSION = 5;
 const currentVersion = db.pragma('user_version', { simple: true });
 
-/* ---------------------------------------------------------------
-   FRESH INSTALL (version 0 → 4): create everything from scratch
-   --------------------------------------------------------------- */
+/* ---------- FRESH INSTALL ---------- */
 if (currentVersion === 0) {
   db.exec(`
     CREATE TABLE departments (
@@ -82,6 +78,15 @@ if (currentVersion === 0) {
       FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
       FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
     );
+    CREATE TABLE file_coholders (
+      file_id   INTEGER NOT NULL,
+      user_id   INTEGER NOT NULL,
+      added_at  TEXT NOT NULL,
+      added_by  INTEGER NOT NULL,
+      PRIMARY KEY (file_id, user_id),
+      FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
     CREATE TABLE movements (
       id           INTEGER PRIMARY KEY AUTOINCREMENT,
       file_id      INTEGER NOT NULL,
@@ -125,43 +130,51 @@ if (currentVersion === 0) {
     CREATE INDEX idx_positions_dept ON positions(department_id, rank);
     CREATE INDEX idx_users_dept     ON users(department_id);
     CREATE INDEX idx_attach_file    ON attachments(file_id);
+    CREATE INDEX idx_cohold_user    ON file_coholders(user_id);
   `);
   db.pragma(`user_version = ${SCHEMA_VERSION}`);
-  console.log('[FileTrack] Fresh database created (schema v4).');
+  console.log('[FileTrack] Fresh database created (schema v5).');
 }
 
-/* ---------------------------------------------------------------
-   MIGRATION: v3 → v4 — ADD ATTACHMENTS ONLY, keep all data
-   --------------------------------------------------------------- */
-else if (currentVersion === 3) {
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS attachments (
-      id          INTEGER PRIMARY KEY AUTOINCREMENT,
-      file_id     INTEGER NOT NULL,
-      uploaded_by INTEGER NOT NULL,
-      orig_name   TEXT    NOT NULL,
-      stored_name TEXT    NOT NULL,
-      mime_type   TEXT    NOT NULL,
-      size_bytes  INTEGER NOT NULL,
-      created_at  TEXT    NOT NULL,
-      FOREIGN KEY (file_id)     REFERENCES files(id) ON DELETE CASCADE,
-      FOREIGN KEY (uploaded_by) REFERENCES users(id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_attach_file ON attachments(file_id);
-  `);
+/* ---------- MIGRATIONS ---------- */
+else {
+  if (currentVersion < 4) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS attachments (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        file_id     INTEGER NOT NULL,
+        uploaded_by INTEGER NOT NULL,
+        orig_name   TEXT    NOT NULL,
+        stored_name TEXT    NOT NULL,
+        mime_type   TEXT    NOT NULL,
+        size_bytes  INTEGER NOT NULL,
+        created_at  TEXT    NOT NULL,
+        FOREIGN KEY (file_id)     REFERENCES files(id) ON DELETE CASCADE,
+        FOREIGN KEY (uploaded_by) REFERENCES users(id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_attach_file ON attachments(file_id);
+    `);
+    console.log('[FileTrack] Migrated to v4 (attachments).');
+  }
+  if (currentVersion < 5) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS file_coholders (
+        file_id  INTEGER NOT NULL,
+        user_id  INTEGER NOT NULL,
+        added_at TEXT NOT NULL,
+        added_by INTEGER NOT NULL,
+        PRIMARY KEY (file_id, user_id),
+        FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+      CREATE INDEX IF NOT EXISTS idx_cohold_user ON file_coholders(user_id);
+    `);
+    console.log('[FileTrack] Migrated to v5 (co-holders / CC).');
+  }
   db.pragma(`user_version = ${SCHEMA_VERSION}`);
-  console.log('[FileTrack] Migrated schema v3 → v4 (attachments added).');
 }
 
-/* ---------------------------------------------------------------
-   SAFETY: any future schema change → migrate additively here.
-   If schema is somehow newer than the code, warn but don't wipe.
-   --------------------------------------------------------------- */
-else if (currentVersion > SCHEMA_VERSION) {
-  console.warn(`[FileTrack] DB schema is v${currentVersion} but code expects v${SCHEMA_VERSION}.`);
-}
-
-/* ---------- seed default data ---------- */
+/* ---------- seed ---------- */
 if (db.prepare('SELECT COUNT(*) AS c FROM departments').get().c === 0) {
   const bcrypt = require('bcryptjs');
   const now = new Date().toISOString();

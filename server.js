@@ -57,15 +57,12 @@ function audit(userId, action, details, req) {
   } catch (e) {}
 }
 
-/* ---------------- rate limit on login ---------------- */
-/* =========================================================
-   Login throttling — failed-attempt only, per (IP + username)
-   ========================================================= */
-const loginFailures = new Map();   // key: `${ip}|${username}` → { n, firstAt, nextAt }
-const FAIL_WINDOW_MS   = 15 * 60 * 1000;   // 15 min rolling window for counting
-const FREE_FAILS       = 5;                // attempts before any delay kicks in
-const BACKOFF_MS       = [0, 0, 0, 0, 0, 5000, 15000, 30000, 60000, 120000]; // by fail count
-const HARD_LOCK_AT     = 10;               // after this many fails → 5-min lockout
+/* ---------------- login throttling ---------------- */
+const loginFailures = new Map();
+const FAIL_WINDOW_MS   = 15 * 60 * 1000;
+const FREE_FAILS       = 5;
+const BACKOFF_MS       = [0, 0, 0, 0, 0, 5000, 15000, 30000, 60000, 120000];
+const HARD_LOCK_AT     = 10;
 const HARD_LOCK_MS     = 5 * 60 * 1000;
 
 function rateLimitLogin(req, res, next) {
@@ -84,24 +81,19 @@ function rateLimitLogin(req, res, next) {
     const waitMs = Math.max(0, r.nextAt - now);
     if (waitMs > 0) {
       const waitSec = Math.ceil(waitMs / 1000);
-      console.warn(`[login-lock] ${key} hard-locked for ${waitSec}s`);
       res.set('Retry-After', String(waitSec));
       return res.status(429).json({
         error: `Too many failed attempts. Try again in ${waitSec} second${waitSec === 1 ? '' : 's'}.`,
         retryAfter: waitSec
       });
     }
-    // lockout expired → reset counter but keep window
-    r.n = 0;
-    r.firstAt = now;
-    r.nextAt = 0;
+    r.n = 0; r.firstAt = now; r.nextAt = 0;
   }
 
   if (r.n >= FREE_FAILS) {
     const waitMs = Math.max(0, r.nextAt - now);
     if (waitMs > 0) {
       const waitSec = Math.ceil(waitMs / 1000);
-      console.warn(`[login-backoff] ${key} must wait ${waitSec}s (${r.n} fails)`);
       res.set('Retry-After', String(waitSec));
       return res.status(429).json({
         error: `Please wait ${waitSec} second${waitSec === 1 ? '' : 's'} before trying again.`,
@@ -110,27 +102,21 @@ function rateLimitLogin(req, res, next) {
     }
   }
 
-  // Passed. Attach a helper that the login handler calls on failure.
   req.registerLoginFailure = () => {
     const r2 = loginFailures.get(key) || { n: 0, firstAt: now, nextAt: 0 };
     r2.n++;
     r2.nextAt = now + (BACKOFF_MS[Math.min(r2.n, BACKOFF_MS.length - 1)] || 0);
     if (r2.n >= HARD_LOCK_AT) r2.nextAt = now + HARD_LOCK_MS;
     loginFailures.set(key, r2);
-    const remaining = Math.max(0, HARD_LOCK_AT - r2.n);
-    return { attempts: r2.n, remaining };
+    return { attempts: r2.n, remaining: Math.max(0, HARD_LOCK_AT - r2.n) };
   };
   req.clearLoginFailures = () => loginFailures.delete(key);
-
   next();
 }
 
-/* background sweep so the Map doesn't grow forever */
 setInterval(() => {
   const cut = Date.now() - FAIL_WINDOW_MS * 4;
-  for (const [k, v] of loginFailures) {
-    if (v.firstAt < cut) loginFailures.delete(k);
-  }
+  for (const [k, v] of loginFailures) if (v.firstAt < cut) loginFailures.delete(k);
 }, 5 * 60 * 1000);
 
 /* ---------------- auth helpers ---------------- */
@@ -186,32 +172,20 @@ app.post('/api/login', rateLimitLogin, (req, res) => {
   if (!u || !u.active) {
     const { attempts, remaining } = req.registerLoginFailure();
     audit(u ? u.id : null, 'LOGIN_FAILED', 'Unknown/inactive user', req);
-    return res.status(401).json({
-      error: 'Invalid username or password',
-      attempts,
-      remaining
-    });
+    return res.status(401).json({ error: 'Invalid username or password', attempts, remaining });
   }
   if (!bcrypt.compareSync(password, u.password_hash)) {
     const { attempts, remaining } = req.registerLoginFailure();
     audit(u.id, 'LOGIN_FAILED', 'Wrong password', req);
-    return res.status(401).json({
-      error: 'Invalid username or password',
-      attempts,
-      remaining
-    });
+    return res.status(401).json({ error: 'Invalid username or password', attempts, remaining });
   }
-
-  // success → wipe the throttle counter for this (IP + username)
   req.clearLoginFailures();
 
   const token = crypto.randomBytes(32).toString('hex');
   const now = new Date();
   db.prepare('INSERT INTO sessions (token,user_id,created_at,expires_at) VALUES (?,?,?,?)')
     .run(token, u.id, now.toISOString(), new Date(now.getTime() + SESSION_MS).toISOString());
-  res.cookie(COOKIE, token, {
-    httpOnly: true, sameSite: 'lax', maxAge: SESSION_MS, secure: req.secure
-  });
+  res.cookie(COOKIE, token, { httpOnly: true, sameSite: 'lax', maxAge: SESSION_MS, secure: req.secure });
   audit(u.id, 'LOGIN', 'ok', req);
   res.json({ user: publicUser(userWithMeta(u.id)) });
 });
@@ -426,6 +400,41 @@ function addParticipant(fileId, userId) {
   db.prepare('INSERT OR IGNORE INTO file_participants (file_id,user_id,added_at) VALUES (?,?,?)')
     .run(fileId, userId, new Date().toISOString());
 }
+function addCoholder(fileId, userId, addedBy) {
+  db.prepare('INSERT OR IGNORE INTO file_coholders (file_id,user_id,added_at,added_by) VALUES (?,?,?,?)')
+    .run(fileId, userId, new Date().toISOString(), addedBy);
+}
+function removeCoholder(fileId, userId) {
+  db.prepare('DELETE FROM file_coholders WHERE file_id=? AND user_id=?').run(fileId, userId);
+}
+function coholdersOf(fileId) {
+  return db.prepare(`
+    SELECT u.id, u.full_name, u.username,
+           p.name AS position_name,
+           d.code AS department_code, d.name AS department_name
+    FROM file_coholders c
+    JOIN users u ON u.id = c.user_id
+    LEFT JOIN positions p ON p.id = u.position_id
+    LEFT JOIN departments d ON d.id = u.department_id
+    WHERE c.file_id = ?
+    ORDER BY c.added_at
+  `).all(fileId);
+}
+function ccUsersOf(fileId) {
+  return db.prepare(`
+    SELECT DISTINCT u.id, u.full_name, u.username,
+           p.name AS position_name,
+           d.code AS department_code, d.name AS department_name,
+           (SELECT MAX(m.created_at) FROM movements m
+            WHERE m.file_id = ? AND m.action = 'CC' AND m.to_user_id = u.id) AS cc_at
+    FROM movements m
+    JOIN users u ON u.id = m.to_user_id
+    LEFT JOIN positions p ON p.id = u.position_id
+    LEFT JOIN departments d ON d.id = u.department_id
+    WHERE m.file_id = ? AND m.action = 'CC'
+    ORDER BY cc_at DESC
+  `).all(fileId, fileId);
+}
 
 /* ---------------- files ---------------- */
 app.get('/api/files', requireAuth, (req, res) => {
@@ -459,6 +468,7 @@ app.get('/api/files/:ref', requireAuth, (req, res) => {
   const f = db.prepare('SELECT * FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
   if (!f) return res.status(404).json({ error: 'File not found' });
   if (!canView(req.user, f)) return res.status(403).json({ error: 'You do not have access to this file' });
+
   const movements = db.prepare(`
     SELECT m.*, fu.full_name AS from_name, fp.name AS from_position,
                 tu.full_name AS to_name, tp.name AS to_position
@@ -470,6 +480,7 @@ app.get('/api/files/:ref', requireAuth, (req, res) => {
     WHERE m.file_id=?
     ORDER BY datetime(m.created_at) DESC, m.id DESC
   `).all(f.id);
+
   const holder = db.prepare(`
     SELECT u.id, u.full_name, u.username, p.name AS position_name, p.rank,
            d.code AS department_code
@@ -478,12 +489,21 @@ app.get('/api/files/:ref', requireAuth, (req, res) => {
     WHERE u.id=?
   `).get(f.current_holder_id);
   const creator = db.prepare('SELECT full_name FROM users WHERE id=?').get(f.creator_id);
+
   let chain = [];
   if (f.department_id) {
     chain = db.prepare(`SELECT id,name,rank FROM positions WHERE department_id=? ORDER BY rank`).all(f.department_id);
   } else {
     chain = db.prepare(`SELECT id,name,rank FROM positions WHERE department_id IS NULL ORDER BY rank`).all();
   }
+
+  const coholders = coholdersOf(f.id);
+  const ccUsers   = ccUsersOf(f.id);
+  const isHolder  = f.current_holder_id === req.user.id;
+  const isCoHolder = coholders.some(c => c.id === req.user.id);
+  const isCCOnly  = !isHolder && !isCoHolder && ccUsers.some(c => c.id === req.user.id) && !req.user.is_super_admin;
+  const can_move  = (req.user.is_super_admin || isHolder || isCoHolder) && f.status === 'Open';
+
   res.json({
     file: Object.assign({}, f, {
       holder_name: holder ? holder.full_name : '—',
@@ -494,7 +514,12 @@ app.get('/api/files/:ref', requireAuth, (req, res) => {
     }),
     movements,
     chain,
-    can_move: (req.user.is_super_admin || f.current_holder_id === req.user.id) && f.status === 'Open'
+    coholders,
+    ccUsers,
+    can_move,
+    can_cc: can_move,
+    is_holder: isHolder,
+    is_cc_only: isCCOnly
   });
 });
 
@@ -531,16 +556,20 @@ app.post('/api/files', requireAuth, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-/* ---------- targets (forward / return) ---------- */
+/* ---------- targets: forward (multi), return (single), cc (multi) ---------- */
 app.get('/api/files/:ref/targets', requireAuth, (req, res) => {
   const f = db.prepare('SELECT * FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
   if (!f) return res.status(404).json({ error: 'Not found' });
   if (!canView(req.user, f)) return res.status(403).json({ error: 'No access' });
-  if (f.current_holder_id !== req.user.id && !req.user.is_super_admin)
+
+  const isHolder = f.current_holder_id === req.user.id;
+  const isCo = !!db.prepare('SELECT 1 FROM file_coholders WHERE file_id=? AND user_id=?').get(f.id, req.user.id);
+  if (!isHolder && !isCo && !req.user.is_super_admin)
     return res.status(403).json({ error: 'You do not hold this file' });
 
   const me = req.user;
 
+  // Exclude: self, existing coholders, current holder, and anyone already CC'd
   const forward = db.prepare(`
     SELECT u.id, u.full_name, u.username,
            p.name AS position_name, p.rank,
@@ -549,9 +578,13 @@ app.get('/api/files/:ref/targets', requireAuth, (req, res) => {
     FROM users u
     JOIN positions p ON p.id = u.position_id
     LEFT JOIN departments d ON d.id = u.department_id
-    WHERE u.active=1 AND u.id != ?
+    WHERE u.active=1
+      AND u.id != ?
+      AND u.id NOT IN (SELECT user_id FROM file_coholders WHERE file_id=?)
+      AND u.id NOT IN (SELECT to_user_id FROM movements WHERE file_id=? AND action='CC')
+      AND u.id != (SELECT current_holder_id FROM files WHERE id=?)
     ORDER BY (d.id IS NULL) DESC, d.name, p.rank, u.full_name
-  `).all(me.id);
+  `).all(me.id, f.id, f.id, f.id);
 
   const back = db.prepare(`
     SELECT u.id, u.full_name, u.username,
@@ -564,49 +597,178 @@ app.get('/api/files/:ref/targets', requireAuth, (req, res) => {
     JOIN users u ON u.id = m.to_user_id
     LEFT JOIN positions p ON p.id = u.position_id
     LEFT JOIN departments d ON d.id = u.department_id
-    WHERE m.file_id=? AND u.id != ? AND u.active=1 AND m.action != 'Remark'
+    WHERE m.file_id=? AND u.id != ? AND u.active=1
+      AND m.action IN ('Forwarded','Returned','Created')
     GROUP BY u.id
     ORDER BY last_held DESC
   `).all(f.id, me.id);
 
-  res.json({ forward, return: back });
+  // CC candidates: any active user, excluding self, current holder, and coholders
+  const cc = db.prepare(`
+    SELECT u.id, u.full_name, u.username,
+           p.name AS position_name, p.rank,
+           d.id   AS department_id,
+           d.code AS department_code, d.name AS department_name
+    FROM users u
+    JOIN positions p ON p.id = u.position_id
+    LEFT JOIN departments d ON d.id = u.department_id
+    WHERE u.active=1
+      AND u.id != ?
+      AND u.id NOT IN (SELECT to_user_id FROM movements WHERE file_id=? AND action='CC')
+      AND u.id != (SELECT current_holder_id FROM files WHERE id=?)
+      AND u.id NOT IN (SELECT user_id FROM file_coholders WHERE file_id=?)
+    ORDER BY (d.id IS NULL) DESC, d.name, p.rank, u.full_name
+  `).all(me.id, f.id, f.id, f.id);
+
+  res.json({ forward, return: back, cc });
 });
 
-/* ---------- move ---------- */
+/* ---------- move (multi-target for Forwarded, single for Returned) ---------- */
 app.post('/api/files/:ref/move', requireAuth, (req, res) => {
-  const { toUserId, action = 'Forwarded', remarks = '' } = req.body || {};
-  if (!toUserId) return res.status(400).json({ error: 'Target user required' });
+  const body = req.body || {};
+  const action = body.action || 'Forwarded';
+  const remarks = String(body.remarks || '').slice(0, 2000).trim();
+
+  // Accept both shapes: { toUserIds: [...] } or { toUserId: n } (legacy)
+  let targets = [];
+  if (Array.isArray(body.toUserIds)) targets = body.toUserIds.map(Number).filter(Boolean);
+  else if (body.toUserId) targets = [Number(body.toUserId)];
+  targets = Array.from(new Set(targets));
+
+  if (!targets.length) return res.status(400).json({ error: 'At least one recipient required' });
   if (!['Forwarded', 'Returned'].includes(action)) return res.status(400).json({ error: 'Invalid action' });
+
   const f = db.prepare('SELECT * FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
   if (!f) return res.status(404).json({ error: 'Not found' });
   if (f.status !== 'Open') return res.status(400).json({ error: 'File is closed' });
-  if (f.current_holder_id !== req.user.id && !req.user.is_super_admin)
+
+  const isHolder = f.current_holder_id === req.user.id;
+  const isCo = !!db.prepare('SELECT 1 FROM file_coholders WHERE file_id=? AND user_id=?').get(f.id, req.user.id);
+  if (!isHolder && !isCo && !req.user.is_super_admin)
     return res.status(403).json({ error: 'You do not hold this file' });
 
-  const target = db.prepare(`
+  if (action === 'Returned' && targets.length !== 1)
+    return res.status(400).json({ error: 'Return goes to exactly one previous holder' });
+
+  // Validate every target user
+  const placeholders = targets.map(() => '?').join(',');
+  const users = db.prepare(`
     SELECT u.*, p.rank AS position_rank FROM users u
     JOIN positions p ON p.id = u.position_id
-    WHERE u.id=? AND u.active=1
-  `).get(toUserId);
-  if (!target) return res.status(400).json({ error: 'Target user not found or inactive' });
-  if (target.id === req.user.id) return res.status(400).json({ error: 'Cannot move to yourself' });
+    WHERE u.id IN (${placeholders}) AND u.active=1
+  `).all(...targets);
+  if (users.length !== targets.length)
+    return res.status(400).json({ error: 'One or more recipients are invalid or inactive' });
+  if (targets.includes(req.user.id))
+    return res.status(400).json({ error: 'Cannot move to yourself' });
 
   if (action === 'Returned') {
     const prev = db.prepare('SELECT 1 FROM movements WHERE file_id=? AND to_user_id=? LIMIT 1')
-      .get(f.id, target.id);
+      .get(f.id, targets[0]);
     if (!prev) return res.status(403).json({ error: 'Can only return to a previous holder' });
   }
 
   const now = new Date().toISOString();
-  db.transaction(() => {
-    const newDept = f.department_id || target.department_id || null;
-    db.prepare('UPDATE files SET current_holder_id=?, department_id=?, updated_at=? WHERE id=?')
-      .run(target.id, newDept, now, f.id);
-    db.prepare(`INSERT INTO movements (file_id,action,from_user_id,to_user_id,remarks,created_at)
-      VALUES (?,?,?,?,?,?)`).run(f.id, action, req.user.id, target.id, remarks, now);
-    addParticipant(f.id, target.id);
-  })();
-  audit(req.user.id, 'FILE_MOVED', `${f.ref_no} ${action} -> user#${target.id}`, req);
+  const primary = users.find(u => u.id === targets[0]);
+  const newDept = f.department_id || primary.department_id || null;
+
+  try {
+    db.transaction(() => {
+      db.prepare('UPDATE files SET current_holder_id=?, department_id=?, updated_at=? WHERE id=?')
+        .run(primary.id, newDept, now, f.id);
+
+      for (const u of users) {
+        db.prepare(`INSERT INTO movements (file_id,action,from_user_id,to_user_id,remarks,created_at)
+          VALUES (?,?,?,?,?,?)`).run(f.id, action, req.user.id, u.id, remarks, now);
+        addParticipant(f.id, u.id);
+      }
+
+      // Any previous coholders become regular participants (they keep visibility but lose "co-holder" status)
+      if (isHolder || isCo) {
+        const oldCo = coholdersOf(f.id);
+        for (const c of oldCo) removeCoholder(f.id, c.id);
+      }
+      // The new primary holder is the current holder (not a co-holder)
+      removeCoholder(f.id, primary.id);
+      // Any additional targets become co-holders
+      for (const u of users) {
+        if (u.id !== primary.id) addCoholder(f.id, u.id, req.user.id);
+      }
+      // The mover also stays as a participant
+      addParticipant(f.id, req.user.id);
+    })();
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+
+  audit(req.user.id, 'FILE_MOVED',
+    `${f.ref_no} ${action} -> ${users.map(u => '#' + u.id).join(',')}`, req);
+  res.json({ ok: true, count: users.length, primary: primary.id });
+});
+
+/* ---------- CC ---------- */
+app.post('/api/files/:ref/cc', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const remarks = String(body.remarks || '').slice(0, 2000).trim();
+  let targets = Array.isArray(body.toUserIds)
+    ? body.toUserIds.map(Number).filter(Boolean)
+    : (body.toUserId ? [Number(body.toUserId)] : []);
+  targets = Array.from(new Set(targets));
+  if (!targets.length) return res.status(400).json({ error: 'At least one recipient required' });
+
+  const f = db.prepare('SELECT * FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
+  if (!f) return res.status(404).json({ error: 'Not found' });
+  if (f.status !== 'Open') return res.status(400).json({ error: 'File is closed' });
+
+  const isHolder = f.current_holder_id === req.user.id;
+  const isCo = !!db.prepare('SELECT 1 FROM file_coholders WHERE file_id=? AND user_id=?').get(f.id, req.user.id);
+  if (!isHolder && !isCo && !req.user.is_super_admin)
+    return res.status(403).json({ error: 'You do not hold this file' });
+
+  const placeholders = targets.map(() => '?').join(',');
+  const users = db.prepare(`
+    SELECT u.* FROM users u
+    WHERE u.id IN (${placeholders}) AND u.active=1
+  `).all(...targets);
+  if (users.length !== targets.length)
+    return res.status(400).json({ error: 'One or more recipients are invalid or inactive' });
+  if (targets.includes(req.user.id))
+    return res.status(400).json({ error: 'Cannot CC yourself' });
+  if (targets.includes(f.current_holder_id))
+    return res.status(400).json({ error: 'Cannot CC the current holder' });
+
+  // Filter out anyone already CC'd or already a co-holder
+  const alreadyCC = db.prepare(`
+    SELECT DISTINCT to_user_id FROM movements WHERE file_id=? AND action='CC'
+  `).all(f.id).map(r => r.to_user_id);
+  const alreadyCo = coholdersOf(f.id).map(c => c.id);
+  const filtered = users.filter(u => !alreadyCC.includes(u.id) && !alreadyCo.includes(u.id));
+  if (!filtered.length) return res.status(400).json({ error: 'All recipients are already CC\'d or co-holders' });
+
+  const now = new Date().toISOString();
+  try {
+    db.transaction(() => {
+      for (const u of filtered) {
+        db.prepare(`INSERT INTO movements (file_id,action,from_user_id,to_user_id,remarks,created_at)
+          VALUES (?,?,?,?,?,?)`).run(f.id, 'CC', req.user.id, u.id, remarks, now);
+        addParticipant(f.id, u.id);
+      }
+      db.prepare('UPDATE files SET updated_at=? WHERE id=?').run(now, f.id);
+    })();
+  } catch (e) { return res.status(500).json({ error: e.message }); }
+
+  audit(req.user.id, 'FILE_CC', `${f.ref_no} -> ${filtered.map(u => '#' + u.id).join(',')}`, req);
+  res.json({ ok: true, count: filtered.length });
+});
+
+/* Remove a CC (super admin or current holder) — doesn't remove participant row (they keep visibility of what they already saw) */
+app.delete('/api/files/:ref/cc/:userId', requireAuth, (req, res) => {
+  const f = db.prepare('SELECT * FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
+  if (!f) return res.status(404).json({ error: 'Not found' });
+  if (f.current_holder_id !== req.user.id && !req.user.is_super_admin)
+    return res.status(403).json({ error: 'Only the holder or super admin can remove a CC' });
+  const uid = +req.params.userId;
+  const r = db.prepare(`DELETE FROM movements WHERE file_id=? AND action='CC' AND to_user_id=?`).run(f.id, uid);
+  if (!r.changes) return res.status(404).json({ error: 'CC entry not found' });
+  audit(req.user.id, 'FILE_CC_REMOVED', `${f.ref_no} <- #${uid}`, req);
   res.json({ ok: true });
 });
 
@@ -616,6 +778,8 @@ app.post('/api/files/:ref/remark', requireAuth, (req, res) => {
   const f = db.prepare('SELECT * FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
   if (!f) return res.status(404).json({ error: 'Not found' });
   if (!canView(req.user, f)) return res.status(403).json({ error: 'No access' });
+  if (f.current_holder_id !== req.user.id && !req.user.is_super_admin)
+    return res.status(403).json({ error: 'Only the holder or super admin can add remarks' });
   const now = new Date().toISOString();
   db.transaction(() => {
     db.prepare(`INSERT INTO movements (file_id,action,from_user_id,to_user_id,remarks,created_at)
@@ -648,7 +812,6 @@ app.post('/api/files/:ref/status', requireAuth, (req, res) => {
 app.delete('/api/files/:ref', requireAuth, requireSuper, (req, res) => {
   const f = db.prepare('SELECT id FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
   if (!f) return res.status(404).json({ error: 'Not found' });
-  // Remove attachment files from disk (DB rows cascade)
   const rows = db.prepare('SELECT stored_name FROM attachments WHERE file_id=?').all(f.id);
   db.prepare('DELETE FROM files WHERE id=?').run(f.id);
   for (const r of rows) fs.unlink(path.join(UPLOAD_DIR, r.stored_name), () => {});
@@ -656,7 +819,7 @@ app.delete('/api/files/:ref', requireAuth, requireSuper, (req, res) => {
   res.json({ ok: true });
 });
 
-/* ---------------- attachments ---------------- */
+/* ---------------- attachments (unchanged rules) ---------------- */
 app.get('/api/files/:ref/attachments', requireAuth, (req, res) => {
   const f = db.prepare('SELECT * FROM files WHERE ref_no=? COLLATE NOCASE').get(req.params.ref);
   if (!f) return res.status(404).json({ error: 'File not found' });
@@ -838,7 +1001,6 @@ app.get('/api/dashboard', requireAuth, (req, res) => {
 /* ---------------- SPA fallback + errors ---------------- */
 app.get(/^\/(?!api).*/, (_req, res) => res.sendFile(path.join(ROOT, 'public', 'index.html')));
 
-/* multer / upload error → JSON */
 app.use((err, _req, res, next) => {
   if (err instanceof multer.MulterError) {
     const msg = err.code === 'LIMIT_FILE_SIZE' ? 'File too large (max 15 MB)' : err.message;
@@ -857,6 +1019,12 @@ app.use((err, _req, res, _next) => {
 
 /* ---------------- cleanup + start ---------------- */
 db.prepare("DELETE FROM sessions WHERE datetime(expires_at) < datetime('now')").run();
+setInterval(() => {
+  try {
+    const r = db.prepare("DELETE FROM sessions WHERE datetime(expires_at) < datetime('now')").run();
+    if (r.changes > 0) console.log(`[cleanup] removed ${r.changes} expired session(s)`);
+  } catch (e) { console.error('[cleanup] failed:', e.message); }
+}, 30 * 60 * 1000);
 
 app.listen(PORT, () => {
   console.log(`\n  🗂  FileTrack running at http://localhost:${PORT}`);

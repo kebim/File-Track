@@ -19,13 +19,14 @@ async function api(path, opts = {}) {
   const ct = res.headers.get('content-type') || '';
   if (ct.includes('application/json')) data = await res.json().catch(() => null);
   if (res.status === 401 && !path.startsWith('/api/login')) {
-    state.user = null; showLogin('Your session has expired — please sign in again.');
+    state.user = null;
+    showLogin('Your session has expired — please sign in again.');
     throw new Error('Session expired — please sign in');
   }
   if (!res.ok) {
     const e = new Error((data && data.error) || res.statusText);
     e.status = res.status;
-    e.data = data;          // <-- so callers can read `attempts`/`remaining`/`retryAfter`
+    e.data = data;
     throw e;
   }
   return data;
@@ -107,10 +108,11 @@ document.getElementById('modal').addEventListener('click', e => { if (e.target.i
 document.addEventListener('keydown', e => { if (e.key === 'Escape') hideModal(); });
 
 /* ---------------- auth ---------------- */
-function showLogin() {
+function showLogin(msg) {
   document.getElementById('loginOverlay').style.display = 'flex';
   document.querySelector('.app').style.display = 'none';
   document.getElementById('bottomnav').style.display = 'none';
+  if (msg) toast(msg, 'error');
 }
 function showApp() {
   document.getElementById('loginOverlay').style.display = 'none';
@@ -141,6 +143,28 @@ function clearLoginForm() {
   } catch (e) {}
 }
 
+/* login msg element */
+const loginMsgEl = document.getElementById('loginMsg');
+let backoffTimer = null;
+function showLoginMsg(text, kind, holdMs) {
+  if (!loginMsgEl) return;
+  clearTimeout(backoffTimer);
+  loginMsgEl.textContent = text;
+  loginMsgEl.className = 'login-msg show ' + (kind || 'error');
+  if (holdMs && holdMs > 0) {
+    backoffTimer = setTimeout(() => {
+      loginMsgEl.className = 'login-msg';
+      loginMsgEl.textContent = '';
+    }, holdMs);
+  }
+}
+function clearLoginMsg() {
+  if (!loginMsgEl) return;
+  clearTimeout(backoffTimer);
+  loginMsgEl.className = 'login-msg';
+  loginMsgEl.textContent = '';
+}
+
 document.getElementById('loginForm').addEventListener('submit', async e => {
   e.preventDefault();
   const form = e.target;
@@ -148,6 +172,7 @@ document.getElementById('loginForm').addEventListener('submit', async e => {
   const username = document.getElementById('loginUser').value.trim();
   const password = document.getElementById('loginPass').value;
 
+  clearLoginMsg();
   if (btn) {
     btn.disabled = true;
     btn.dataset.label = btn.textContent;
@@ -161,19 +186,43 @@ document.getElementById('loginForm').addEventListener('submit', async e => {
     showApp();
     if (!location.hash) location.hash = '#/dashboard';
     router();
+    clearLoginMsg();
     toast('Welcome, ' + r.user.full_name, 'ok');
     if (r.user.must_change_password) setTimeout(() => openChangePassword(true), 500);
   } catch (err) {
+    const data = err.data || {};
     if (err.status === 429) {
-      toast(err.message || 'Too many attempts. Please wait.', 'error');
+      const wait = Number(data.retryAfter || 5);
+      if (btn) { btn.disabled = true; btn.textContent = `Wait ${wait}s…`; }
+      let left = wait;
+      showLoginMsg(`Too many attempts. Try again in ${left}s…`, 'warn');
+      clearInterval(window.__loginCountdown);
+      window.__loginCountdown = setInterval(() => {
+        left--;
+        if (left > 0) {
+          showLoginMsg(`Too many attempts. Try again in ${left}s…`, 'warn');
+          if (btn) btn.textContent = `Wait ${left}s…`;
+        } else {
+          clearInterval(window.__loginCountdown);
+          window.__loginCountdown = null;
+          showLoginMsg('You can try again now.', 'warn', 2500);
+          if (btn) { btn.disabled = false; btn.textContent = btn.dataset.label || 'Sign In'; }
+        }
+      }, 1000);
     } else if (err.status === 401) {
-      // Show how many tries are left — feels much less "frozen"
-      toast(err.message || 'Invalid username or password', 'error');
+      const left = (typeof data.remaining === 'number') ? data.remaining : null;
+      showLoginMsg(
+        left != null && left <= 5
+          ? `Invalid username or password. ${left} attempt${left === 1 ? '' : 's'} left before a short delay.`
+          : 'Invalid username or password.',
+        'error',
+        6000
+      );
     } else {
-      toast(err.message, 'error');
+      showLoginMsg(err.message || 'Sign-in failed. Please try again.', 'error', 6000);
     }
   } finally {
-    if (btn) {
+    if (btn && !window.__loginCountdown) {
       btn.disabled = false;
       btn.textContent = btn.dataset.label || 'Sign In';
     }
@@ -451,8 +500,19 @@ async function renderFileDetail(ref) {
       ${esc(e.message)}<br><br><a class="btn" href="#/files">← Back to my files</a></div>`;
     return;
   }
-  const { file: f, movements, chain, can_move } = data;
+
+  const { file: f, movements, chain, can_move, coholders = [], ccUsers = [], is_cc_only } = data;
   const qrUrl = `/api/files/${encodeURIComponent(f.ref_no)}/qr.png?size=400&mode=${state.qrMode}&t=${Date.now()}`;
+
+  /* Build movement-action pill */
+  const actionPill = (a) => {
+    if (a === 'CC') return '<span class="pill urgent">CC</span>';
+    if (a === 'Forwarded') return '<span class="pill brand">Forwarded</span>';
+    if (a === 'Returned') return '<span class="pill normal">Returned</span>';
+    if (a === 'Created') return '<span class="pill ok">Created</span>';
+    if (a === 'Closed') return '<span class="pill muted">Closed</span>';
+    return `<span class="pill muted">${esc(a)}</span>`;
+  };
 
   view.innerHTML = `
     <div class="page-head">
@@ -466,6 +526,13 @@ async function renderFileDetail(ref) {
       </div>
     </div>
 
+    ${is_cc_only ? `<div class="card pad" style="margin-bottom:16px">
+      <div class="readonly-note">
+        👁 <b>CC / Observer view.</b> You are copied on this file for reference only.
+        You can read the history, view attachments and download them, but cannot forward, return, close, remark, or upload.
+      </div>
+    </div>` : ''}
+
     <div class="detail-grid">
       <div class="col">
         <div class="card pad">
@@ -476,18 +543,55 @@ async function renderFileDetail(ref) {
               return `<span class="chip ${isCur ? 'current' : ''}">${esc(c.name)}${isCur ? ` · ${esc(f.holder_name)}` : ''}</span>${i < chain.length - 1 ? '<span class="arrow">→</span>' : ''}`;
             }).join('')}
           </div>
-          <p class="hint">Files travel one step down (Forward) or back up (Return). Forward can also cross into other departments.</p>
+          <p class="hint">Files travel one step down (Forward) or back up (Return). Forward can also cross into other departments and hit multiple recipients at once.</p>
 
           <dl class="kv">
             <dt>Status</dt><dd><span class="pill ${f.status === 'Open' ? 'ok' : 'muted'}">${esc(f.status)}</span></dd>
             <dt>Priority</dt><dd><span class="pill ${prioClass(f.priority)}">${esc(f.priority)}</span></dd>
             <dt>Creator</dt><dd>${esc(f.creator_name)}</dd>
-            <dt>Current Holder</dt><dd><b>${esc(f.holder_name)}</b> — ${esc(f.holder_position)}${f.department_code ? ` (${esc(f.department_code)})` : ''}</dd>
+            <dt>Primary Holder</dt><dd><b>${esc(f.holder_name)}</b> — ${esc(f.holder_position)}${f.department_code ? ` (${esc(f.department_code)})` : ''}</dd>
             <dt>Created</dt><dd>${fmt(f.created_at)}</dd>
             <dt>Last Movement</dt><dd>${fmt(f.updated_at)}</dd>
             ${f.due_date ? `<dt>Target Date</dt><dd>${esc(f.due_date)}</dd>` : ''}
             ${f.description ? `<dt>Description</dt><dd>${esc(f.description)}</dd>` : ''}
           </dl>
+
+          ${coholders.length ? `
+            <div style="margin-top:16px">
+              <h2 style="font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-bottom:6px">
+                Co-holders (${coholders.length})
+              </h2>
+              <div class="holder-list">
+                ${coholders.map(c => `
+                  <div class="holder-row">
+                    <span class="ico">🤝</span>
+                    <span class="who">
+                      <b>${esc(c.full_name)}</b>
+                      <small>${esc(c.position_name)}${c.department_code ? ' · ' + esc(c.department_code) : ''} · @${esc(c.username)}</small>
+                    </span>
+                    <span class="tag">Co-holder</span>
+                  </div>`).join('')}
+              </div>
+            </div>` : ''}
+
+          ${ccUsers.length ? `
+            <div style="margin-top:16px">
+              <h2 style="font-size:13px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted);margin-bottom:6px">
+                CC — For Info Only (${ccUsers.length})
+              </h2>
+              <div class="holder-list">
+                ${ccUsers.map(c => `
+                  <div class="holder-row">
+                    <span class="ico">👁</span>
+                    <span class="who">
+                      <b>${esc(c.full_name)}</b>
+                      <small>${esc(c.position_name)}${c.department_code ? ' · ' + esc(c.department_code) : ''} · @${esc(c.username)}</small>
+                    </span>
+                    <span class="tag cc">CC</span>
+                    ${can_move ? `<button class="rm" data-rmcc="${c.id}" title="Remove CC">×</button>` : ''}
+                  </div>`).join('')}
+              </div>
+            </div>` : ''}
         </div>
 
         <div class="card pad">
@@ -496,7 +600,7 @@ async function renderFileDetail(ref) {
             ${movements.map(h => `
               <div class="tl-item">
                 <div class="tl-top">
-                  <b>${esc(h.action)}</b>
+                  ${actionPill(h.action)}
                   <span class="tl-route">${h.from_name ? esc(h.from_name) + ' → ' + esc(h.to_name) : 'by ' + esc(h.to_name)}</span>
                 </div>
                 ${h.remarks ? `<div class="tl-remarks">“${esc(h.remarks)}”</div>` : ''}
@@ -524,7 +628,7 @@ async function renderFileDetail(ref) {
         <div class="card pad" id="attachCard">
           <h2>Attachments <span id="attachCount" class="muted" style="font-weight:500"></span></h2>
           <div id="attachList" class="attach-list"><p class="muted">Loading…</p></div>
-          ${(f.status === 'Open' && (can_move || isSuper())) ? `
+          ${(f.status === 'Open' && can_move) ? `
             <div class="attach-upload">
               <label class="lbl">Add Attachment</label>
               <input type="file" id="attachInput"
@@ -538,13 +642,15 @@ async function renderFileDetail(ref) {
 
         <div class="card pad">
           <h2>Actions</h2>
-          ${!can_move ? `<p class="hint" style="margin-top:0;color:var(--warn)">
+          ${is_cc_only ? `<div class="readonly-note">You are CC'd on this file — read only.</div>` : ''}
+          ${!can_move && !is_cc_only ? `<p class="hint" style="margin-top:0;color:var(--warn)">
             ${f.status === 'Closed' ? 'File is closed.' : `Only <b>${esc(f.holder_name)}</b>${isSuper() ? ' or a super admin' : ''} can move this file.`}
           </p>` : ''}
           <div class="actions-stack">
-            <button class="btn primary block" id="btnFwd" ${!can_move ? 'disabled' : ''}>➡ Forward to User</button>
+            <button class="btn primary block" id="btnFwd" ${!can_move ? 'disabled' : ''}>➡ Forward to User(s)</button>
+            <button class="btn block" id="btnCC" ${!can_move ? 'disabled' : ''}>👁 Forward a Copy (CC)</button>
             <button class="btn block" id="btnRet" ${!can_move ? 'disabled' : ''}>⬅ Return to Previous Holder</button>
-            <button class="btn block" id="btnRemark" ${!can_move && !isSuper() ? 'disabled' : ''}>💬 Add Remark</button>
+            <button class="btn block" id="btnRemark" ${!can_move ? 'disabled' : ''}>💬 Add Remark</button>
             ${f.status === 'Open'
               ? `<button class="btn block" id="btnClose" ${!can_move ? 'disabled' : ''}>🔒 Close File</button>`
               : `<button class="btn block" id="btnReopen" ${!can_move ? 'disabled' : ''}>🔓 Reopen File</button>`}
@@ -587,11 +693,23 @@ async function renderFileDetail(ref) {
   /* ---- other actions ---- */
   document.getElementById('btnPrint').addEventListener('click', () => printLabel(f, qrUrl));
   bind('btnFwd',   () => openMoveModal(f.ref_no, 'Forwarded'));
+  bind('btnCC',    () => openCCModal(f.ref_no));
   bind('btnRet',   () => openMoveModal(f.ref_no, 'Returned'));
   bind('btnRemark',() => addRemark(f.ref_no));
   bind('btnClose', () => setStatus(f.ref_no, 'Closed'));
   bind('btnReopen',() => setStatus(f.ref_no, 'Open'));
   bind('btnDelete',() => deleteFile(f.ref_no));
+
+  /* remove CC */
+  view.querySelectorAll('[data-rmcc]').forEach(b =>
+    b.addEventListener('click', async () => {
+      const uid = b.dataset.rmcc;
+      try {
+        await api(`/api/files/${encodeURIComponent(f.ref_no)}/cc/${uid}`, { method: 'DELETE' });
+        toast('CC removed', 'ok');
+        renderFileDetail(f.ref_no);
+      } catch (e) { toast(e.message, 'error'); }
+    }));
 
   /* ---- attachments ---- */
   initAttachments(f.ref_no);
@@ -686,19 +804,11 @@ function deleteAttachment(ref, id, refresh) {
   });
 }
 
-/* ---------------- Move (forward / return) ---------------- */
-async function openMoveModal(ref, action) {
-  let data;
-  try { data = await api(`/api/files/${encodeURIComponent(ref)}/targets`); }
-  catch (e) { return toast(e.message, 'error'); }
+/* ---------------- multi-picker (shared for Forward + CC) ---------------- */
+function buildMultiPicker(list, idPrefix) {
+  if (!list.length) return `<p class="muted">No eligible recipients.</p>`;
 
-  const list = action === 'Forwarded' ? data.forward : data.return;
-  const label = action === 'Forwarded' ? 'Forward to' : 'Return to';
-
-  if (!list.length) {
-    return toast(`No eligible recipients for ${label.toLowerCase()}`, 'error');
-  }
-
+  // Group by department
   const groups = new Map();
   list.forEach(u => {
     const key = u.department_id == null ? '__global__' : `d${u.department_id}`;
@@ -706,19 +816,21 @@ async function openMoveModal(ref, action) {
       groups.set(key, {
         label: u.department_id == null
           ? 'Global (no department)'
-          : (u.department_name ? `${u.department_name}${u.department_code ? ' (' + u.department_code + ')' : ''}` : 'Department #' + u.department_id),
+          : (u.department_name
+              ? `${u.department_name}${u.department_code ? ' (' + u.department_code + ')' : ''}`
+              : 'Department #' + u.department_id),
         rows: []
       });
     }
     groups.get(key).rows.push(u);
   });
 
-  const pickerHtml = Array.from(groups.values()).map(g => `
+  const html = Array.from(groups.values()).map(g => `
     <div class="pick-group">
       <div class="pick-group-head">${esc(g.label)}</div>
       ${g.rows.map(u => `
         <label class="pick-row">
-          <input type="radio" name="target" value="${u.id}">
+          <input type="checkbox" name="${idPrefix}" value="${u.id}">
           <span class="who">
             <b>${esc(u.full_name)}</b>
             <small>${esc(u.position_name)}${u.department_code ? ' · ' + esc(u.department_code) : ''} · @${esc(u.username)}</small>
@@ -726,32 +838,193 @@ async function openMoveModal(ref, action) {
         </label>`).join('')}
     </div>`).join('');
 
+  return `
+    <div class="pick-tools">
+      <input type="text" id="${idPrefix}Search" placeholder="Filter by name, username, position or department…">
+      <span class="count" id="${idPrefix}Count">0 selected</span>
+    </div>
+    <div class="picker" id="${idPrefix}List">${html}</div>`;
+}
+
+function wireMultiPicker(idPrefix, onChange) {
+  const root = document.getElementById(idPrefix + 'List');
+  const cnt  = document.getElementById(idPrefix + 'Count');
+  const srch = document.getElementById(idPrefix + 'Search');
+  if (!root || !cnt) return;
+
+  const updateCount = () => {
+    const n = root.querySelectorAll(`input[name="${idPrefix}"]:checked`).length;
+    cnt.textContent = `${n} selected`;
+    if (onChange) onChange(n);
+  };
+
+  root.addEventListener('change', updateCount);
+
+  if (srch) {
+    srch.addEventListener('input', () => {
+      const q = srch.value.trim().toLowerCase();
+      root.querySelectorAll('.pick-group').forEach(g => {
+        let visible = 0;
+        g.querySelectorAll('.pick-row').forEach(row => {
+          const text = row.textContent.toLowerCase();
+          const match = !q || text.includes(q);
+          row.style.display = match ? '' : 'none';
+          if (match) visible++;
+        });
+        g.style.display = visible ? '' : 'none';
+      });
+    });
+  }
+
+  updateCount();
+}
+
+/* ---------------- Move (Forward multi / Return single) ---------------- */
+async function openMoveModal(ref, action) {
+  let data;
+  try { data = await api(`/api/files/${encodeURIComponent(ref)}/targets`); }
+  catch (e) { return toast(e.message, 'error'); }
+
+  const isFwd = action === 'Forwarded';
+  const list  = isFwd ? data.forward : data.return;
+  const label = isFwd ? 'Forward to' : 'Return to';
+
+  if (!list.length) {
+    return toast(`No eligible recipients for ${label.toLowerCase()}`, 'error');
+  }
+
+  let bodyHtml;
+  if (isFwd) {
+    bodyHtml = `
+      <p class="picker-hint">Pick <b>one or more</b> recipients for <b>${esc(ref)}</b>. The first pick becomes the primary holder; the rest are added as co-holders.</p>
+      ${buildMultiPicker(list, 'fwd')}
+      <label class="lbl" style="margin-top:10px">Remarks</label>
+      <textarea id="mvRemarks" rows="2" placeholder="Optional"></textarea>`;
+  } else {
+    const groups = new Map();
+    list.forEach(u => {
+      const key = u.department_id == null ? '__global__' : `d${u.department_id}`;
+      if (!groups.has(key)) {
+        groups.set(key, {
+          label: u.department_id == null
+            ? 'Global (no department)'
+            : (u.department_name
+                ? `${u.department_name}${u.department_code ? ' (' + u.department_code + ')' : ''}`
+                : 'Department #' + u.department_id),
+          rows: []
+        });
+      }
+      groups.get(key).rows.push(u);
+    });
+
+    const pickerHtml = Array.from(groups.values()).map(g => `
+      <div class="pick-group">
+        <div class="pick-group-head">${esc(g.label)}</div>
+        ${g.rows.map(u => `
+          <label class="pick-row">
+            <input type="radio" name="retTarget" value="${u.id}">
+            <span class="who">
+              <b>${esc(u.full_name)}</b>
+              <small>${esc(u.position_name)}${u.department_code ? ' · ' + esc(u.department_code) : ''} · @${esc(u.username)}</small>
+            </span>
+          </label>`).join('')}
+      </div>`).join('');
+
+    bodyHtml = `
+      <p class="picker-hint">Pick <b>one</b> previous holder to return <b>${esc(ref)}</b> to.</p>
+      <div class="picker">${pickerHtml}</div>
+      <label class="lbl" style="margin-top:10px">Remarks</label>
+      <textarea id="mvRemarks" rows="2" placeholder="Optional"></textarea>`;
+  }
+
   showModal({
     title: label,
-    body: `
-      <p class="muted" style="margin-top:10px">Pick a recipient for <b>${esc(ref)}</b>. Recipients may belong to <b>any</b> department.</p>
-      <label class="lbl">Recipient</label>
-      <div class="picker">${pickerHtml}</div>
-      <label class="lbl">Remarks</label>
-      <textarea id="mvRemarks" rows="2" placeholder="Optional"></textarea>`,
+    body: bodyHtml,
     okLabel: label,
+    hideOk: false,
     onOk: async () => {
-      const pick = document.querySelector('input[name="target"]:checked');
-      if (!pick) { toast('Pick a recipient', 'error'); return false; }
       const remarks = (document.getElementById('mvRemarks').value || '').trim();
+
+      if (isFwd) {
+        const checked = Array.from(document.querySelectorAll('input[name="fwd"]:checked'))
+          .map(el => +el.value);
+        if (!checked.length) { toast('Pick at least one recipient', 'error'); return false; }
+        try {
+          const r = await api(`/api/files/${encodeURIComponent(ref)}/move`, {
+            method: 'POST',
+            body: { toUserIds: checked, action, remarks }
+          });
+          toast(`File forwarded to ${r.count} user${r.count === 1 ? '' : 's'}`, 'ok');
+          router();
+          return true;
+        } catch (e) { toast(e.message, 'error'); return false; }
+      } else {
+        const pick = document.querySelector('input[name="retTarget"]:checked');
+        if (!pick) { toast('Pick a recipient', 'error'); return false; }
+        try {
+          await api(`/api/files/${encodeURIComponent(ref)}/move`, {
+            method: 'POST',
+            body: { toUserIds: [+pick.value], action, remarks }
+          });
+          toast('File returned', 'ok');
+          router();
+          return true;
+        } catch (e) { toast(e.message, 'error'); return false; }
+      }
+    }
+  });
+
+  // After modal opens, wire the multi-picker
+  if (isFwd) {
+    wireMultiPicker('fwd', n => {
+      const ok = document.getElementById('mOk');
+      if (ok) ok.disabled = n === 0;
+    });
+  }
+}
+
+/* ---------------- CC modal ---------------- */
+async function openCCModal(ref) {
+  let data;
+  try { data = await api(`/api/files/${encodeURIComponent(ref)}/targets`); }
+  catch (e) { return toast(e.message, 'error'); }
+
+  const list = data.cc || [];
+  if (!list.length) {
+    return toast('No eligible recipients to CC', 'error');
+  }
+
+  showModal({
+    title: 'Forward a Copy (CC)',
+    body: `
+      <p class="picker-hint">Pick <b>one or more</b> users to copy on <b>${esc(ref)}</b>. CC users are observers — they can read the history and download attachments, but cannot act on the file.</p>
+      ${buildMultiPicker(list, 'cc')}
+      <label class="lbl" style="margin-top:10px">Remarks</label>
+      <textarea id="ccRemarks" rows="2" placeholder="Optional — e.g. 'FYI only'"></textarea>`,
+    okLabel: 'Send Copy',
+    onOk: async () => {
+      const checked = Array.from(document.querySelectorAll('input[name="cc"]:checked')).map(el => +el.value);
+      if (!checked.length) { toast('Pick at least one recipient', 'error'); return false; }
+      const remarks = (document.getElementById('ccRemarks').value || '').trim();
       try {
-        await api(`/api/files/${encodeURIComponent(ref)}/move`, {
+        const r = await api(`/api/files/${encodeURIComponent(ref)}/cc`, {
           method: 'POST',
-          body: { toUserId: +pick.value, action, remarks }
+          body: { toUserIds: checked, remarks }
         });
-        toast('File ' + (action === 'Forwarded' ? 'forwarded' : 'returned'), 'ok');
+        toast(`Copied to ${r.count} user${r.count === 1 ? '' : 's'}`, 'ok');
         router();
         return true;
       } catch (e) { toast(e.message, 'error'); return false; }
     }
   });
+
+  wireMultiPicker('cc', n => {
+    const ok = document.getElementById('mOk');
+    if (ok) ok.disabled = n === 0;
+  });
 }
 
+/* ---------------- Remark ---------------- */
 function addRemark(ref) {
   showModal({
     title: 'Add Remark',
@@ -866,7 +1139,7 @@ function renderScan() {
         <input id="sRef" placeholder="e.g. FTS-2026-0001" autocomplete="off">
         <button class="btn primary" id="btnLookup">Open</button>
       </div>
-      <p class="hint">You can only open files you created or received.</p>
+      <p class="hint">You can only open files you created, received, or were CC'd on.</p>
     </div>
     <div class="card pad">
       <h2>Camera Scan</h2>
